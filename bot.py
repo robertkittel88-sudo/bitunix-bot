@@ -1,15 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║         Bitunix Multi-Asset AI Trading Bot               ║
+║         Bitunix Multi-Asset AI Trading Bot v2            ║
 ║         Powered by Claude AI                             ║
 ║                                                          ║
 ║  Symbole:  BTC/USDT · ETH/USDT · HBAR/USDT             ║
-║  Start:    py bot.py                                     ║
+║  Neu:      SL/TP Tracking · SELL-Signale · Telegram     ║
 ╚══════════════════════════════════════════════════════════╝
-
-Benötigt:
-  - Anthropic API Key (https://console.anthropic.com)
-  - Optional: Bitunix API Key (nur für echtes Trading)
 """
 
 import json
@@ -17,7 +13,7 @@ import math
 import os
 import time
 import csv
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import anthropic
@@ -28,28 +24,29 @@ load_dotenv()
 
 # ── Konfiguration ─────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-BITUNIX_API_KEY    = os.getenv("BITUNIX_API_KEY", "")
-BITUNIX_SECRET_KEY = os.getenv("BITUNIX_SECRET_KEY", "")
+TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SYMBOLS    = ["BTCUSDT", "ETHUSDT", "HBARUSDT"]
-INTERVAL   = "15m"          # Kerzen-Zeitrahmen
-LIMIT      = 60             # Anzahl Kerzen
-CYCLE_MIN  = 15             # Minuten zwischen Analysen
-MIN_CONF   = 65             # Minimale Confidence für Signal-Logging
-AUTO_TRADE = False          # True = echte Orders platzieren (Vorsicht!)
+INTERVAL   = "15m"
+LIMIT      = 60
+CYCLE_MIN  = 15
+MIN_CONF   = 65
+AUTO_TRADE = False
 
-BINANCE_BASE = "https://fapi.binance.com"
-LOG_FILE     = "signals.csv"
-REPORT_FILE  = "performance.json"
+BINANCE_BASE  = "https://fapi.binance.com"
+LOG_FILE      = "signals.csv"
+REPORT_FILE   = "performance.json"
+OPEN_FILE     = "open_signals.json"
+RESULTS_FILE  = "results.json"
 
-# ── Farben für Konsole ────────────────────────────────────────────────────────
+# ── Farben ────────────────────────────────────────────────────────────────────
 class C:
     GREEN  = "\033[92m"
     RED    = "\033[91m"
     YELLOW = "\033[93m"
     BLUE   = "\033[94m"
     CYAN   = "\033[96m"
-    ORANGE = "\033[33m"
     GRAY   = "\033[90m"
     BOLD   = "\033[1m"
     RESET  = "\033[0m"
@@ -61,9 +58,7 @@ def blue(t):   return f"{C.BLUE}{t}{C.RESET}"
 def cyan(t):   return f"{C.CYAN}{t}{C.RESET}"
 def gray(t):   return f"{C.GRAY}{t}{C.RESET}"
 def bold(t):   return f"{C.BOLD}{t}{C.RESET}"
-
-def ts():
-    return gray(f"[{datetime.now().strftime('%H:%M:%S')}]")
+def ts():      return gray(f"[{datetime.now().strftime('%H:%M:%S')}]")
 
 def log(msg, level="INFO"):
     prefix = {
@@ -74,10 +69,22 @@ def log(msg, level="INFO"):
         "BUY":   green("BUY  "),
         "SELL":  red("SELL "),
         "HOLD":  yellow("HOLD "),
+        "WIN":   green("WIN  "),
+        "LOSS":  red("LOSS "),
     }.get(level, "     ")
     print(f"{ts()} {prefix} {msg}")
 
-# ── Technische Indikatoren ────────────────────────────────────────────────────
+# ── Telegram ──────────────────────────────────────────────────────────────────
+def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
+    except Exception as e:
+        log(f"Telegram Fehler: {e}", "WARN")
+
+# ── Indikatoren ───────────────────────────────────────────────────────────────
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -123,15 +130,121 @@ def fetch_candles(symbol):
     data = resp.json()
     if not isinstance(data, list) or len(data) == 0:
         raise ValueError(f"Keine Kerzendaten für {symbol}")
-    # Binance Format: [openTime, open, high, low, close, volume, ...]
     return [
         {"time": int(c[0]), "open": float(c[1]), "high": float(c[2]),
          "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])}
         for c in data
     ]
 
+# ── SL/TP Tracking ────────────────────────────────────────────────────────────
+def load_open_signals():
+    if Path(OPEN_FILE).exists():
+        with open(OPEN_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_open_signals(signals):
+    with open(OPEN_FILE, "w") as f:
+        json.dump(signals, f, indent=2)
+
+def load_results():
+    if Path(RESULTS_FILE).exists():
+        with open(RESULTS_FILE, "r") as f:
+            return json.load(f)
+    return {"wins": 0, "losses": 0, "total_pnl": 0.0, "by_symbol": {}}
+
+def save_results(results):
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(results, f, indent=2)
+
+def check_open_signals(symbol, current_price):
+    open_signals = load_open_signals()
+    results = load_results()
+    updated = []
+    closed = []
+
+    for sig in open_signals:
+        if sig["symbol"] != symbol:
+            updated.append(sig)
+            continue
+
+        sl = sig["stopLoss"]
+        tp = sig["takeProfit"]
+        entry = sig["entry"]
+        direction = sig["signal"]
+        result = None
+        pnl = 0.0
+
+        if direction == "BUY":
+            if current_price >= tp:
+                result = "WIN"
+                pnl = round((tp - entry) / entry * 100, 3)
+            elif current_price <= sl:
+                result = "LOSS"
+                pnl = round((sl - entry) / entry * 100, 3)
+        elif direction == "SELL":
+            if current_price <= tp:
+                result = "WIN"
+                pnl = round((entry - tp) / entry * 100, 3)
+            elif current_price >= sl:
+                result = "LOSS"
+                pnl = round((entry - sl) / entry * 100, 3)
+
+        if result:
+            log(f"[{symbol}] {direction} → {result} | PnL: {'+' if pnl > 0 else ''}{pnl}%",
+                "WIN" if result == "WIN" else "LOSS")
+
+            # Results updaten
+            if symbol not in results["by_symbol"]:
+                results["by_symbol"][symbol] = {"wins": 0, "losses": 0, "pnl": 0.0}
+            if result == "WIN":
+                results["wins"] += 1
+                results["by_symbol"][symbol]["wins"] += 1
+            else:
+                results["losses"] += 1
+                results["by_symbol"][symbol]["losses"] += 1
+            results["total_pnl"] = round(results["total_pnl"] + pnl, 3)
+            results["by_symbol"][symbol]["pnl"] = round(
+                results["by_symbol"][symbol].get("pnl", 0) + pnl, 3)
+            save_results(results)
+
+            # Telegram
+            emoji = "✅" if result == "WIN" else "❌"
+            send_telegram(
+                f"{emoji} <b>{result}: {symbol} {direction}</b>\n"
+                f"Entry: ${entry:,.4f}\n"
+                f"Close: ${current_price:,.4f}\n"
+                f"PnL: {'+' if pnl > 0 else ''}{pnl}%"
+            )
+            closed.append(sig)
+        else:
+            # Noch offen – max. 24h behalten
+            age_h = (time.time() - sig["openTime"]) / 3600
+            if age_h < 24:
+                updated.append(sig)
+            else:
+                log(f"[{symbol}] Signal nach 24h abgelaufen (kein SL/TP getroffen)", "WARN")
+
+    save_open_signals(updated)
+    return results
+
+def add_open_signal(signal_data):
+    if signal_data.get("signal") in ["BUY", "SELL"] and signal_data.get("confidence", 0) >= MIN_CONF:
+        open_signals = load_open_signals()
+        open_signals.append({
+            "symbol":    signal_data["symbol"],
+            "signal":    signal_data["signal"],
+            "entry":     signal_data["entry"],
+            "stopLoss":  signal_data["stopLoss"],
+            "takeProfit":signal_data["takeProfit"],
+            "confidence":signal_data["confidence"],
+            "openTime":  time.time(),
+            "openDate":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        save_open_signals(open_signals)
+
 # ── Claude Analyse ────────────────────────────────────────────────────────────
-def analyze_with_claude(client, symbol, candles, perf_context=""):
+def analyze_with_claude(client, symbol, candles, perf_context="", results_context=""):
     closes  = [c["close"] for c in candles]
     volumes = [c["volume"] for c in candles]
     rsi    = calc_rsi(closes)
@@ -143,34 +256,32 @@ def analyze_with_claude(client, symbol, candles, perf_context=""):
     prev   = candles[-2]
     change = ((last["close"] - prev["close"]) / prev["close"] * 100)
 
-    # ── Volumen-Analyse ──────────────────────────────────────────────────────
-    avg_vol_20    = sum(volumes[-20:]) / 20
-    avg_vol_5     = sum(volumes[-5:]) / 5
-    last_vol      = volumes[-1]
-    vol_ratio     = round(last_vol / avg_vol_20, 2) if avg_vol_20 > 0 else 1.0
-    vol_spike     = vol_ratio >= 2.0   # Volumen 2x über Durchschnitt = Spike
-    vol_trend     = "INCREASING" if avg_vol_5 > avg_vol_20 else "DECREASING"
+    avg_vol_20 = sum(volumes[-20:]) / 20
+    avg_vol_5  = sum(volumes[-5:]) / 5
+    last_vol   = volumes[-1]
+    vol_ratio  = round(last_vol / avg_vol_20, 2) if avg_vol_20 > 0 else 1.0
+    vol_spike  = vol_ratio >= 2.0
+    vol_trend  = "INCREASING" if avg_vol_5 > avg_vol_20 else "DECREASING"
 
-    # Gegenbewegungswarnung: hohes Volumen + Preis an Extrempunkt
-    counter_move_warning = ""
+    counter_move = ""
     if vol_spike:
         if rsi and rsi > 65:
-            counter_move_warning = f"⚠ HIGH VOLUME SPIKE ({vol_ratio}x avg) at RSI {rsi} – possible exhaustion, reversal DOWN likely"
+            counter_move = f"VOLUME SPIKE ({vol_ratio}x) at RSI {rsi} – exhaustion, reversal DOWN likely"
         elif rsi and rsi < 35:
-            counter_move_warning = f"⚠ HIGH VOLUME SPIKE ({vol_ratio}x avg) at RSI {rsi} – possible exhaustion, reversal UP likely"
+            counter_move = f"VOLUME SPIKE ({vol_ratio}x) at RSI {rsi} – exhaustion, reversal UP likely"
         else:
-            counter_move_warning = f"⚠ HIGH VOLUME SPIKE ({vol_ratio}x avg) – watch for reversal"
+            counter_move = f"VOLUME SPIKE ({vol_ratio}x) – watch for reversal"
 
     candle_str = "\n".join(
         f"{datetime.fromtimestamp(c['time']/1000).strftime('%H:%M')} "
         f"O:{c['open']} H:{c['high']} L:{c['low']} C:{c['close']} V:{int(c['volume'])}"
         for c in candles[-12:]
     )
-
     bb_str = f"{bb['upper']}/{bb['mid']}/{bb['lower']}" if bb else "N/A"
 
     prompt = f"""You are a professional crypto futures trader analyzing {symbol} on {INTERVAL} timeframe.
-{perf_context}
+{perf_context}{results_context}
+
 LAST 12 CANDLES:
 {candle_str}
 
@@ -184,27 +295,23 @@ INDICATORS:
 • Current price:      {last['close']}
 
 VOLUME ANALYSIS:
-• Last volume:        {int(last_vol)}
-• Avg volume (20):    {int(avg_vol_20)}
-• Volume ratio:       {vol_ratio}x (last vs 20-period avg)
+• Volume ratio:       {vol_ratio}x avg
 • Volume trend:       {vol_trend}
-• Volume spike:       {'YES – ' + counter_move_warning if vol_spike else 'NO'}
+• Volume spike:       {'YES – ' + counter_move if vol_spike else 'NO'}
 
-IMPORTANT VOLUME RULES:
-- A volume spike (2x+ average) at RSI extremes (>65 or <35) often signals exhaustion and counter-move
-- High volume at resistance = likely reversal DOWN
-- High volume at support = likely reversal UP  
-- Do NOT enter in the direction of a spike at extremes – wait for confirmation
-- Decreasing volume on a trend = trend weakening
+RULES:
+- Be BALANCED: give SELL signals when bearish confluence exists, not just BUY
+- SELL when: price below EMAs + RSI falling + MACD negative + volume confirms
+- BUY when: price above EMAs + RSI rising + MACD positive + volume confirms
+- Volume spike at extremes = counter-move signal
+- Only signal when 3+ indicators align. Otherwise HOLD.
+- Set SL 1-2% away, TP 2-3% away.
 
-Be conservative. Only signal BUY/SELL with clear multi-indicator confluence including volume confirmation.
-Set SL 1-2% away from entry, TP 2-4% away.
-
-Respond ONLY with valid JSON, no markdown, no extra text:
+Respond ONLY with valid JSON:
 {{
   "signal": "BUY" or "SELL" or "HOLD",
   "confidence": integer 0-100,
-  "reasoning": "brief explanation max 150 chars",
+  "reasoning": "max 150 chars",
   "entry": {last['close']},
   "stopLoss": number,
   "takeProfit": number,
@@ -221,7 +328,6 @@ Respond ONLY with valid JSON, no markdown, no extra text:
         messages=[{"role": "user", "content": prompt}]
     )
     text = message.content[0].text.strip()
-    # JSON extrahieren
     start = text.find("{")
     end   = text.rfind("}") + 1
     return json.loads(text[start:end])
@@ -232,28 +338,29 @@ def save_signal(signal_data):
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "timestamp", "symbol", "signal", "confidence", "entry",
-            "stopLoss", "takeProfit", "risk", "trend", "rsi", "reasoning"
+            "stopLoss", "takeProfit", "risk", "trend", "rsi", "volumeRatio", "reasoning"
         ])
         if not file_exists:
             writer.writeheader()
         writer.writerow({
-            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol":     signal_data.get("symbol"),
-            "signal":     signal_data.get("signal"),
-            "confidence": signal_data.get("confidence"),
-            "entry":      signal_data.get("entry"),
-            "stopLoss":   signal_data.get("stopLoss"),
-            "takeProfit": signal_data.get("takeProfit"),
-            "risk":       signal_data.get("risk"),
-            "trend":      signal_data.get("trend"),
-            "rsi":        signal_data.get("rsi"),
-            "reasoning":  signal_data.get("reasoning"),
+            "timestamp":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol":      signal_data.get("symbol"),
+            "signal":      signal_data.get("signal"),
+            "confidence":  signal_data.get("confidence"),
+            "entry":       signal_data.get("entry"),
+            "stopLoss":    signal_data.get("stopLoss"),
+            "takeProfit":  signal_data.get("takeProfit"),
+            "risk":        signal_data.get("risk"),
+            "trend":       signal_data.get("trend"),
+            "rsi":         signal_data.get("rsi"),
+            "volumeRatio": signal_data.get("volumeRatio"),
+            "reasoning":   signal_data.get("reasoning"),
         })
 
-# ── Performance laden ─────────────────────────────────────────────────────────
+# ── Performance ───────────────────────────────────────────────────────────────
 def load_performance():
     if Path(REPORT_FILE).exists():
-        with open(REPORT_FILE, "r", encoding="utf-8") as f:
+        with open(REPORT_FILE, "r") as f:
             return json.load(f)
     return {}
 
@@ -261,41 +368,83 @@ def get_perf_context(symbol, perf):
     data = perf.get(symbol, {})
     if not data or data.get("total", 0) == 0:
         return ""
-    return (f"\nHISTORY ({data['total']} signals): "
-            f"BUY: {data.get('buy',0)}x | SELL: {data.get('sell',0)}x | HOLD: {data.get('hold',0)}x")
+    return (f"\nSIGNAL HISTORY ({data['total']} total): "
+            f"BUY: {data.get('buy',0)} | SELL: {data.get('sell',0)} | HOLD: {data.get('hold',0)}")
+
+def get_results_context(symbol):
+    results = load_results()
+    sym_data = results.get("by_symbol", {}).get(symbol, {})
+    if not sym_data:
+        return ""
+    wins   = sym_data.get("wins", 0)
+    losses = sym_data.get("losses", 0)
+    pnl    = sym_data.get("pnl", 0)
+    total  = wins + losses
+    wr     = round(wins / total * 100) if total > 0 else 0
+    return f"\nRESULTS ({symbol}): {wins}W/{losses}L | Win-Rate: {wr}% | PnL: {pnl:+.2f}%"
 
 def update_performance(symbol, signal, perf):
     if symbol not in perf:
         perf[symbol] = {"total": 0, "buy": 0, "sell": 0, "hold": 0}
     perf[symbol]["total"] += 1
     perf[symbol][signal.lower()] = perf[symbol].get(signal.lower(), 0) + 1
-    with open(REPORT_FILE, "w", encoding="utf-8") as f:
+    with open(REPORT_FILE, "w") as f:
         json.dump(perf, f, indent=2)
     return perf
 
+# ── Tägliche Zusammenfassung ──────────────────────────────────────────────────
+def send_daily_summary(perf):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    results = load_results()
+    wins    = results.get("wins", 0)
+    losses  = results.get("losses", 0)
+    total   = wins + losses
+    wr      = round(wins / total * 100) if total > 0 else 0
+    pnl     = results.get("total_pnl", 0)
+
+    msg = f"📊 <b>TÄGLICHE ZUSAMMENFASSUNG</b>\n"
+    msg += f"━━━━━━━━━━━━━━━━━━━━\n"
+    msg += f"Gesamt: {wins}W / {losses}L | Win-Rate: {wr}%\n"
+    msg += f"Gesamt PnL: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n\n"
+
+    for sym in SYMBOLS:
+        d  = perf.get(sym, {})
+        rd = results.get("by_symbol", {}).get(sym, {})
+        w  = rd.get("wins", 0)
+        l  = rd.get("losses", 0)
+        p  = rd.get("pnl", 0)
+        msg += f"<b>{sym}</b>: {d.get('buy',0)}B/{d.get('sell',0)}S/{d.get('hold',0)}H"
+        if w + l > 0:
+            msg += f" | {w}W/{l}L | {'+' if p >= 0 else ''}{p:.2f}%"
+        msg += "\n"
+
+    send_telegram(msg)
+    log("Tägliche Zusammenfassung per Telegram gesendet", "OK")
+
 # ── Signal anzeigen ───────────────────────────────────────────────────────────
 def print_signal(symbol, result, price):
-    sig = result["signal"]
-    conf = result["confidence"]
-    trend = result["trend"]
-    rsi_val = result.get("rsi", "?")
+    sig      = result["signal"]
+    conf     = result["confidence"]
+    trend    = result["trend"]
+    rsi_val  = result.get("rsi", "?")
+    vol_ratio = result.get("volumeRatio", 1.0)
+    vol_spike = result.get("volumeSpike", False)
 
-    sig_str = green(f"▲ {sig}") if sig == "BUY" else red(f"▼ {sig}") if sig == "SELL" else yellow(f"● {sig}")
+    sig_str  = green(f"▲ {sig}") if sig == "BUY" else red(f"▼ {sig}") if sig == "SELL" else yellow(f"● {sig}")
     conf_str = green(f"{conf}%") if conf >= MIN_CONF else yellow(f"{conf}%")
+    vol_str  = f"{vol_ratio}x {'⚠ SPIKE!' if vol_spike else ''}"
 
     print()
     print(f"  ┌─ {bold(symbol)} {'─'*30}")
     print(f"  │  Signal:     {sig_str}  Confidence: {conf_str}")
     print(f"  │  Trend:      {trend}  │  RSI: {rsi_val}")
-    vol_ratio = result.get('volumeRatio', 1.0)
-    vol_spike = result.get('volumeSpike', False)
-    vol_str = f"{vol_ratio}x {'⚠ SPIKE!' if vol_spike else ''}"
     print(f"  │  Volumen:    {vol_str}")
     print(f"  │  Preis:      ${price:,.4f}")
     if sig != "HOLD":
+        sl = result.get("stopLoss", 0)
+        tp = result.get("takeProfit", 0)
         print(f"  │  Entry:      ${result.get('entry', price):,.4f}")
-        sl = result.get('stopLoss', 0)
-        tp = result.get('takeProfit', 0)
         print(f"  │  Stop Loss:  {red(f'${sl:,.4f}')}")
         print(f"  │  Take Profit:{green(f'${tp:,.4f}')}")
         print(f"  │  Risiko:     {result.get('risk', '?')}")
@@ -303,50 +452,62 @@ def print_signal(symbol, result, price):
     print(f"  └{'─'*38}")
 
 # ── Zusammenfassung ───────────────────────────────────────────────────────────
-def print_summary(results):
+def print_summary(results_dict, results):
     print()
     print(bold(f"  {'─'*50}"))
     print(bold(f"  ZYKLUS ZUSAMMENFASSUNG"))
     print(f"  {'─'*50}")
-    for sym, res in results.items():
+    for sym, res in results_dict.items():
         if res is None:
             print(f"  {sym:<12} {red('FEHLER')}")
             continue
-        sig = res["signal"]
+        sig     = res["signal"]
         sig_str = green("BUY ") if sig == "BUY" else red("SELL") if sig == "SELL" else yellow("HOLD")
-        conf = res["confidence"]
+        conf    = res["confidence"]
         print(f"  {sym:<12} {sig_str}  {conf}%  {gray(res.get('trend','?'))}")
     print(f"  {'─'*50}")
+
+    # Ergebnisse anzeigen
+    wins  = results.get("wins", 0)
+    losses = results.get("losses", 0)
+    total = wins + losses
+    if total > 0:
+        wr  = round(wins / total * 100)
+        pnl = results.get("total_pnl", 0)
+        print(f"\n  TRACKING: {green(f'{wins}W')} / {red(f'{losses}L')} | "
+              f"Win-Rate: {green(f'{wr}%') if wr >= 50 else red(f'{wr}%')} | "
+              f"PnL: {green(f'+{pnl:.2f}%') if pnl >= 0 else red(f'{pnl:.2f}%')}")
     print()
 
 # ── Haupt-Bot-Loop ────────────────────────────────────────────────────────────
 def run_bot():
     print()
     print(bold(green("╔══════════════════════════════════════════════════════════╗")))
-    print(bold(green("║         BITUNIX MULTI-ASSET AI BOT                      ║")))
+    print(bold(green("║         BITUNIX MULTI-ASSET AI BOT v2                   ║")))
     print(bold(green("║         Powered by Claude AI                             ║")))
     print(bold(green("╠══════════════════════════════════════════════════════════╣")))
     print(bold(green(f"║  Symbole:  {' · '.join(SYMBOLS):<44}║")))
     print(bold(green(f"║  Interval: {INTERVAL:<7}  Zyklus: alle {CYCLE_MIN} Minuten          ║")))
-    print(bold(green(f"║  Auto-Trade: {'AN (VORSICHT!)' if AUTO_TRADE else 'AUS (nur Analyse)'}{'':>32}║")))
+    print(bold(green(f"║  Telegram: {'AN' if TELEGRAM_TOKEN else 'AUS – Token in .env eintragen':<40}║")))
     print(bold(green("╚══════════════════════════════════════════════════════════╝")))
     print()
 
-    # API-Key prüfen
     if not ANTHROPIC_API_KEY:
         print(red("FEHLER: ANTHROPIC_API_KEY fehlt in .env!"))
-        print(f"Hole dir einen Key unter: {cyan('https://console.anthropic.com')}")
-        print(f"Dann in .env eintragen:   {cyan('ANTHROPIC_API_KEY=sk-ant-...')}")
         return
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     perf   = load_performance()
     cycle  = 0
+    last_daily_summary = datetime.now().date()
 
-    log(f"Claude API verbunden ✓", "OK")
+    log("Claude API verbunden ✓", "OK")
+    log(f"Telegram: {'aktiv' if TELEGRAM_TOKEN else 'nicht konfiguriert'}", "INFO")
     log(f"Signale werden gespeichert in: {cyan(LOG_FILE)}", "INFO")
-    log(f"Starte erste Analyse...", "INFO")
-    print()
+    log("Starte erste Analyse...", "INFO")
+
+    if TELEGRAM_TOKEN:
+        send_telegram("🚀 <b>Bitunix AI Bot gestartet</b>\nAnalysiere: " + " · ".join(SYMBOLS))
 
     while True:
         cycle += 1
@@ -355,56 +516,79 @@ def run_bot():
         print(bold(f"  ZYKLUS #{cycle}  │  {now}"))
         print(bold(f"{'═'*58}"))
 
-        results = {}
+        results_dict = {}
+        results      = load_results()
 
         for symbol in SYMBOLS:
-            log(f"[{symbol}] Lade Kerzen von Bitunix...", "INFO")
+            log(f"[{symbol}] Lade Kerzen...", "INFO")
             try:
                 candles = fetch_candles(symbol)
                 price   = candles[-1]["close"]
-                log(f"[{symbol}] Preis: ${price:,.4f}  │  {len(candles)} Kerzen geladen", "OK")
+                log(f"[{symbol}] Preis: ${price:,.4f}  │  {len(candles)} Kerzen", "OK")
+
+                # SL/TP Tracking
+                results = check_open_signals(symbol, price)
+
             except Exception as e:
                 log(f"[{symbol}] Kerzen-Fehler: {e}", "ERROR")
-                results[symbol] = None
+                results_dict[symbol] = None
                 time.sleep(3)
                 continue
 
             log(f"[{symbol}] Claude analysiert...", "INFO")
             try:
-                perf_ctx = get_perf_context(symbol, perf)
-                result   = analyze_with_claude(client, symbol, candles, perf_ctx)
+                perf_ctx    = get_perf_context(symbol, perf)
+                results_ctx = get_results_context(symbol)
+                result      = analyze_with_claude(client, symbol, candles, perf_ctx, results_ctx)
                 result["symbol"] = symbol
 
                 print_signal(symbol, result, price)
                 save_signal(result)
                 perf = update_performance(symbol, result["signal"], perf)
-                results[symbol] = result
+                results_dict[symbol] = result
 
-                if result["signal"] != "HOLD":
-                    log(f"[{symbol}] Signal gespeichert in {LOG_FILE}", "OK")
+                # Offenes Signal tracken
+                add_open_signal(result)
+
+                # Telegram bei BUY/SELL
+                if result["signal"] != "HOLD" and result["confidence"] >= MIN_CONF:
+                    emoji = "🟢" if result["signal"] == "BUY" else "🔴"
+                    sl = result.get("stopLoss", 0)
+                    tp = result.get("takeProfit", 0)
+                    send_telegram(
+                        f"{emoji} <b>{result['signal']}: {symbol}</b>\n"
+                        f"Preis: ${price:,.4f}\n"
+                        f"Confidence: {result['confidence']}%\n"
+                        f"Trend: {result['trend']} | RSI: {result.get('rsi','?')}\n"
+                        f"SL: ${sl:,.4f} | TP: ${tp:,.4f}\n"
+                        f"📝 {result.get('reasoning','')}"
+                    )
 
             except Exception as e:
                 log(f"[{symbol}] Analyse-Fehler: {e}", "ERROR")
-                results[symbol] = None
+                results_dict[symbol] = None
 
-            # Kurze Pause zwischen Symbolen
             time.sleep(3)
 
-        # Zusammenfassung
-        print_summary(results)
+        print_summary(results_dict, results)
 
-        # Statistik anzeigen
+        # Statistik
         print(bold("  GESAMTE STATISTIK:"))
         for sym in SYMBOLS:
             d = perf.get(sym, {})
             if d.get("total", 0) > 0:
-                print(f"  {sym:<12} Gesamt: {d['total']:>3}  "
-                      f"BUY: {green(str(d.get('buy',0))):>3}  "
-                      f"SELL: {red(str(d.get('sell',0))):>3}  "
-                      f"HOLD: {yellow(str(d.get('hold',0))):>3}")
+                print(f"  {sym:<12} Gesamt: {d['total']:>4}  "
+                      f"BUY: {green(str(d.get('buy',0)))}  "
+                      f"SELL: {red(str(d.get('sell',0)))}  "
+                      f"HOLD: {yellow(str(d.get('hold',0)))}")
 
-        # Countdown bis nächster Zyklus
-        print()
+        # Tägliche Zusammenfassung
+        today = datetime.now().date()
+        if today > last_daily_summary and datetime.now().hour >= 8:
+            send_daily_summary(perf)
+            last_daily_summary = today
+
+        # Countdown
         log(f"Nächste Analyse in {CYCLE_MIN} Minuten. STRG+C zum Beenden.", "INFO")
         try:
             for remaining in range(CYCLE_MIN * 60, 0, -30):
@@ -414,9 +598,8 @@ def run_bot():
                 time.sleep(30)
         except KeyboardInterrupt:
             print()
-            print()
             log("Bot gestoppt.", "WARN")
-            print(f"\n  Alle Signals gespeichert in: {cyan(LOG_FILE)}")
+            send_telegram("⛔ <b>Bot gestoppt</b>")
             break
 
         print(f"\r{' '*50}\r", end="")
