@@ -497,8 +497,11 @@ def get_claude_summary(stats, all_trades):
         summary += f"\n  BUY: {s['buy_win_rate']}% Win-Rate, SELL: {s['sell_win_rate']}% Win-Rate"
         if s["patterns"]:
             best = sorted(s["patterns"].items(), key=lambda x: x[1]["win_rate"], reverse=True)[:3]
-            best_str = ", ".join([f"{p[0]} ({p[1]['win_rate']}%)" for p in best if p[1]['total'] >= 3])
-            summary += f"\n  Beste Muster: {best_str}"
+            best_parts = []
+            for p in best:
+                if p[1]["total"] >= 3:
+                    best_parts.append(p[0] + " (" + str(p[1]["win_rate"]) + "%)")
+            summary += "\n  Beste Muster: " + ", ".join(best_parts)
 
     prompt = f"""Du bist ein professioneller Crypto-Trading-Analyst.
 
