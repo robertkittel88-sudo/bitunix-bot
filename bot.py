@@ -1,10 +1,9 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║         Bitunix Multi-Asset AI Trading Bot v3            ║
+║         Bitunix Multi-Asset AI Trading Bot v4            ║
 ║         Powered by Claude AI                             ║
 ║                                                          ║
-║  Symbole:  BTC/USDT · ETH/USDT · HBAR/USDT             ║
-║  Neu:      Kerzen-Muster · Support/Resistance · Breakout ║
+║  Neu:  Min-Volumen Filter · Trend-Filter · Conf 75%     ║
 ╚══════════════════════════════════════════════════════════╝
 """
 
@@ -27,12 +26,13 @@ ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SYMBOLS    = ["BTCUSDT", "ETHUSDT", "HBARUSDT"]
-INTERVAL   = "15m"
-LIMIT      = 60
-CYCLE_MIN  = 15
-MIN_CONF   = 65
-AUTO_TRADE = False
+SYMBOLS      = ["BTCUSDT", "ETHUSDT", "HBARUSDT"]
+INTERVAL     = "15m"
+LIMIT        = 60
+CYCLE_MIN    = 15
+MIN_CONF     = 75    # Erhöht von 65% auf 75%
+MIN_VOL_RATIO = 0.3  # Kein Signal unter 0.3x Durchschnittsvolumen
+AUTO_TRADE   = False
 
 BINANCE_BASE  = "https://fapi.binance.com"
 LOG_FILE      = "signals.csv"
@@ -71,6 +71,7 @@ def log(msg, level="INFO"):
         "HOLD":  yellow("HOLD "),
         "WIN":   green("WIN  "),
         "LOSS":  red("LOSS "),
+        "SKIP":  yellow("SKIP "),
     }.get(level, "     ")
     print(f"{ts()} {prefix} {msg}")
 
@@ -84,7 +85,7 @@ def send_telegram(msg):
     except Exception as e:
         log(f"Telegram Fehler: {e}", "WARN")
 
-# ── Technische Indikatoren ────────────────────────────────────────────────────
+# ── Indikatoren ───────────────────────────────────────────────────────────────
 def calc_rsi(closes, period=14):
     if len(closes) < period + 1:
         return None
@@ -116,10 +117,22 @@ def calc_macd(closes):
 def calc_bollinger(closes, period=20):
     if len(closes) < period:
         return None
-    sl = closes[-period:]
+    sl   = closes[-period:]
     mean = sum(sl) / period
-    std = math.sqrt(sum((x - mean) ** 2 for x in sl) / period)
+    std  = math.sqrt(sum((x - mean) ** 2 for x in sl) / period)
     return {"upper": round(mean + 2*std, 6), "mid": round(mean, 6), "lower": round(mean - 2*std, 6)}
+
+def calc_atr(candles, period=14):
+    """Average True Range – misst Volatilität"""
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        high  = candles[i]["high"]
+        low   = candles[i]["low"]
+        close = candles[i-1]["close"]
+        trs.append(max(high - low, abs(high - close), abs(low - close)))
+    return round(sum(trs[-period:]) / period, 6)
 
 # ── Kerzen-Muster ─────────────────────────────────────────────────────────────
 def detect_candle_patterns(candles):
@@ -127,14 +140,14 @@ def detect_candle_patterns(candles):
     if len(candles) < 3:
         return patterns
 
-    c  = candles[-1]   # aktuelle Kerze
-    p1 = candles[-2]   # vorherige
-    p2 = candles[-3]   # vorvorherige
+    c  = candles[-1]
+    p1 = candles[-2]
+    p2 = candles[-3]
 
-    body_c  = abs(c["close"]  - c["open"])
-    body_p1 = abs(p1["close"] - p1["open"])
-    body_p2 = abs(p2["close"] - p2["open"])
-    range_c = c["high"] - c["low"]
+    body_c   = abs(c["close"]  - c["open"])
+    body_p1  = abs(p1["close"] - p1["open"])
+    body_p2  = abs(p2["close"] - p2["open"])
+    range_c  = c["high"] - c["low"]
     range_p1 = p1["high"] - p1["low"]
 
     bull_c  = c["close"]  > c["open"]
@@ -142,68 +155,44 @@ def detect_candle_patterns(candles):
     bull_p1 = p1["close"] > p1["open"]
     bear_p1 = p1["close"] < p1["open"]
 
-    # ── Doji ──────────────────────────────────────────────────────────────────
+    # Doji
     if range_c > 0 and body_c / range_c < 0.1:
-        patterns.append("DOJI – Unentschlossenheit, mögliche Trendwende")
+        patterns.append("DOJI – Unentschlossenheit")
 
-    # ── Hammer (bullisch) ─────────────────────────────────────────────────────
+    # Hammer
     lower_shadow = c["open"] - c["low"] if bull_c else c["close"] - c["low"]
     upper_shadow = c["high"] - c["close"] if bull_c else c["high"] - c["open"]
-    if (lower_shadow > 2 * body_c and upper_shadow < body_c * 0.5
-            and bear_p1 and range_c > 0):
-        patterns.append("HAMMER – Bullisches Umkehrmuster, Kaufdruck von unten")
+    if lower_shadow > 2 * body_c and upper_shadow < body_c * 0.5 and bear_p1 and range_c > 0:
+        patterns.append("HAMMER – Bullisches Umkehrmuster")
 
-    # ── Shooting Star (bärisch) ───────────────────────────────────────────────
+    # Shooting Star
     upper_shadow2 = c["high"] - c["close"] if bull_c else c["high"] - c["open"]
     lower_shadow2 = c["open"] - c["low"] if bull_c else c["close"] - c["low"]
-    if (upper_shadow2 > 2 * body_c and lower_shadow2 < body_c * 0.5
-            and bull_p1 and range_c > 0):
-        patterns.append("SHOOTING STAR – Bärisches Umkehrmuster, Verkaufsdruck von oben")
+    if upper_shadow2 > 2 * body_c and lower_shadow2 < body_c * 0.5 and bull_p1 and range_c > 0:
+        patterns.append("SHOOTING STAR – Bärisches Umkehrmuster")
 
-    # ── Bullish Engulfing ─────────────────────────────────────────────────────
-    if (bull_c and bear_p1
-            and c["open"] < p1["close"]
-            and c["close"] > p1["open"]
-            and body_c > body_p1):
-        patterns.append("BULLISH ENGULFING – Starkes bullisches Umkehrsignal")
+    # Bullish Engulfing
+    if bull_c and bear_p1 and c["open"] < p1["close"] and c["close"] > p1["open"] and body_c > body_p1:
+        patterns.append("BULLISH ENGULFING – Starkes bullisches Signal")
 
-    # ── Bearish Engulfing ─────────────────────────────────────────────────────
-    if (bear_c and bull_p1
-            and c["open"] > p1["close"]
-            and c["close"] < p1["open"]
-            and body_c > body_p1):
-        patterns.append("BEARISH ENGULFING – Starkes bärisches Umkehrsignal")
+    # Bearish Engulfing
+    if bear_c and bull_p1 and c["open"] > p1["close"] and c["close"] < p1["open"] and body_c > body_p1:
+        patterns.append("BEARISH ENGULFING – Starkes bärisches Signal")
 
-    # ── Morning Star (bullisch, 3 Kerzen) ─────────────────────────────────────
-    if (bear_p1 and body_p1 > 0
-            and body_c < body_p1 * 0.3
-            and bull_c
-            and c["close"] > (p2["open"] + p2["close"]) / 2
-            and body_p2 > body_p1 * 0.5):
-        patterns.append("MORNING STAR – Bullisches 3-Kerzen-Umkehrmuster")
+    # Morning Star
+    if bear_p1 and body_p1 > 0 and body_c < body_p1 * 0.3 and bull_c and body_p2 > body_p1 * 0.5:
+        patterns.append("MORNING STAR – Bullisches 3-Kerzen Umkehrmuster")
 
-    # ── Evening Star (bärisch, 3 Kerzen) ──────────────────────────────────────
-    if (bull_p1 and body_p1 > 0
-            and body_c < body_p1 * 0.3
-            and bear_c
-            and c["close"] < (p2["open"] + p2["close"]) / 2
-            and body_p2 > body_p1 * 0.5):
-        patterns.append("EVENING STAR – Bärisches 3-Kerzen-Umkehrmuster")
+    # Evening Star
+    if bull_p1 and body_p1 > 0 and body_c < body_p1 * 0.3 and bear_c and body_p2 > body_p1 * 0.5:
+        patterns.append("EVENING STAR – Bärisches 3-Kerzen Umkehrmuster")
 
-    # ── Three White Soldiers (bullisch) ───────────────────────────────────────
-    if (bull_c and bull_p1
-            and c["close"] > p1["close"]
-            and p1["close"] > p2["close"]
-            and body_c > range_c * 0.6
-            and body_p1 > range_p1 * 0.6):
+    # Three White Soldiers
+    if bull_c and bull_p1 and c["close"] > p1["close"] and p1["close"] > p2["close"] and body_c > range_c * 0.6:
         patterns.append("THREE WHITE SOLDIERS – Starke bullische Fortsetzung")
 
-    # ── Three Black Crows (bärisch) ────────────────────────────────────────────
-    if (bear_c and bear_p1
-            and c["close"] < p1["close"]
-            and p1["close"] < p2["close"]
-            and body_c > range_c * 0.6
-            and body_p1 > range_p1 * 0.6):
+    # Three Black Crows
+    if bear_c and bear_p1 and c["close"] < p1["close"] and p1["close"] < p2["close"] and body_c > range_c * 0.6:
         patterns.append("THREE BLACK CROWS – Starke bärische Fortsetzung")
 
     return patterns
@@ -215,47 +204,32 @@ def find_support_resistance(candles, lookback=20):
     closes = [c["close"] for c in candles[-lookback:]]
     price  = closes[-1]
 
-    resistance = round(max(highs), 6)
-    support    = round(min(lows), 6)
-    mid        = round((resistance + support) / 2, 6)
+    resistance   = round(max(highs), 6)
+    support      = round(min(lows), 6)
+    mid          = round((resistance + support) / 2, 6)
+    dist_to_res  = round((resistance - price) / price * 100, 2)
+    dist_to_sup  = round((price - support) / price * 100, 2)
+    position     = "OBEN" if price > mid else "UNTEN"
 
-    dist_to_res = round((resistance - price) / price * 100, 2)
-    dist_to_sup = round((price - support) / price * 100, 2)
+    return {"resistance": resistance, "support": support, "mid": mid,
+            "dist_res": dist_to_res, "dist_sup": dist_to_sup, "position": position}
 
-    position = "OBEN" if price > mid else "UNTEN"
-
-    return {
-        "resistance":   resistance,
-        "support":      support,
-        "mid":          mid,
-        "dist_res":     dist_to_res,
-        "dist_sup":     dist_to_sup,
-        "position":     position,
-    }
-
-# ── Trend-Struktur (Higher Highs / Lower Lows) ────────────────────────────────
+# ── Trend-Struktur ────────────────────────────────────────────────────────────
 def analyze_trend_structure(candles, lookback=10):
     recent = candles[-lookback:]
-    highs  = [c["high"]  for c in recent]
-    lows   = [c["low"]   for c in recent]
+    highs  = [c["high"] for c in recent]
+    lows   = [c["low"]  for c in recent]
 
     hh = all(highs[i] >= highs[i-1] for i in range(1, len(highs)))
     hl = all(lows[i]  >= lows[i-1]  for i in range(1, len(lows)))
     lh = all(highs[i] <= highs[i-1] for i in range(1, len(highs)))
     ll = all(lows[i]  <= lows[i-1]  for i in range(1, len(lows)))
 
-    if hh and hl:
-        return "UPTREND (Higher Highs + Higher Lows)"
-    elif lh and ll:
-        return "DOWNTREND (Lower Highs + Lower Lows)"
-    elif hh and not hl:
-        return "SCHWACHER UPTREND (Higher Highs, aber keine Higher Lows)"
-    elif ll and not lh:
-        return "SCHWACHER DOWNTREND (Lower Lows, aber keine Lower Highs)"
-    else:
-        return "SEITWÄRTS (keine klare Struktur)"
+    if hh and hl:   return "UPTREND (HH+HL)"
+    elif lh and ll: return "DOWNTREND (LH+LL)"
+    else:           return "SEITWÄRTS"
 
-# ── Breakout Erkennung ────────────────────────────────────────────────────────
+# ── Breakout ──────────────────────────────────────────────────────────────────
 def detect_breakout(candles, sr):
     if len(candles) < 5:
         return None
@@ -263,24 +237,37 @@ def detect_breakout(candles, sr):
     current     = candles[-1]["close"]
     current_vol = candles[-1]["volume"]
     avg_vol     = sum(c["volume"] for c in candles[-20:]) / 20
+    vol_ok      = current_vol > avg_vol * 1.5
 
-    vol_confirmed = current_vol > avg_vol * 1.5
-
-    # Breakout nach oben
     if all(c < sr["resistance"] for c in prev_closes) and current > sr["resistance"]:
-        if vol_confirmed:
-            return "BULLISCHER BREAKOUT – Preis bricht Widerstand mit hohem Volumen"
-        else:
-            return "SCHWACHER BULLISCHER BREAKOUT – Kein Volumen, möglicherweise False Breakout"
-
-    # Breakout nach unten
+        return "BULLISCHER BREAKOUT" + (" (Volumen OK)" if vol_ok else " (schwaches Volumen)")
     if all(c > sr["support"] for c in prev_closes) and current < sr["support"]:
-        if vol_confirmed:
-            return "BÄRISCHER BREAKOUT – Preis bricht Support mit hohem Volumen"
-        else:
-            return "SCHWACHER BÄRISCHER BREAKOUT – Kein Volumen, möglicherweise False Breakout"
-
+        return "BÄRISCHER BREAKOUT" + (" (Volumen OK)" if vol_ok else " (schwaches Volumen)")
     return None
+
+# ── Volumen-Filter (NEU) ──────────────────────────────────────────────────────
+def check_volume_filter(candles):
+    """Gibt False zurück wenn Volumen zu niedrig für zuverlässige Signale"""
+    volumes    = [c["volume"] for c in candles]
+    avg_vol_20 = sum(volumes[-20:]) / 20
+    last_vol   = volumes[-1]
+    vol_ratio  = round(last_vol / avg_vol_20, 2) if avg_vol_20 > 0 else 0
+    return vol_ratio >= MIN_VOL_RATIO, vol_ratio
+
+# ── Trend-Filter (NEU) ────────────────────────────────────────────────────────
+def check_trend_filter(signal, ema20, ema50, rsi):
+    """
+    Verhindert widersprüchliche Signale:
+    - Kein BUY wenn EMA20 < EMA50 UND RSI < 45
+    - Kein SELL wenn EMA20 > EMA50 UND RSI > 55
+    """
+    if signal == "BUY":
+        if ema20 and ema50 and ema20 < ema50 and rsi and rsi < 45:
+            return False, "BUY im Downtrend blockiert (EMA20 < EMA50, RSI < 45)"
+    if signal == "SELL":
+        if ema20 and ema50 and ema20 > ema50 and rsi and rsi > 55:
+            return False, "SELL im Uptrend blockiert (EMA20 > EMA50, RSI > 55)"
+    return True, ""
 
 # ── Kerzen laden ──────────────────────────────────────────────────────────────
 def fetch_candles(symbol):
@@ -328,12 +315,9 @@ def check_open_signals(symbol, current_price):
             updated.append(sig)
             continue
 
-        sl        = sig["stopLoss"]
-        tp        = sig["takeProfit"]
-        entry     = sig["entry"]
-        direction = sig["signal"]
-        result    = None
-        pnl       = 0.0
+        sl = sig["stopLoss"]; tp = sig["takeProfit"]
+        entry = sig["entry"]; direction = sig["signal"]
+        result = None; pnl = 0.0
 
         if direction == "BUY":
             if current_price >= tp:
@@ -364,8 +348,7 @@ def check_open_signals(symbol, current_price):
             emoji = "✅" if result == "WIN" else "❌"
             send_telegram(
                 f"{emoji} <b>{result}: {symbol} {direction}</b>\n"
-                f"Entry: ${entry:,.4f}\n"
-                f"Close: ${current_price:,.4f}\n"
+                f"Entry: ${entry:,.4f} → Close: ${current_price:,.4f}\n"
                 f"PnL: {'+' if pnl > 0 else ''}{pnl}%"
             )
         else:
@@ -400,11 +383,11 @@ def analyze_with_claude(client, symbol, candles, perf_context="", results_contex
     ema50   = calc_ema(closes, 50)
     macd    = calc_macd(closes)
     bb      = calc_bollinger(closes)
+    atr     = calc_atr(candles)
     last    = candles[-1]
     prev    = candles[-2]
     change  = ((last["close"] - prev["close"]) / prev["close"] * 100)
 
-    # Volumen
     avg_vol_20 = sum(volumes[-20:]) / 20
     avg_vol_5  = sum(volumes[-5:]) / 5
     last_vol   = volumes[-1]
@@ -415,27 +398,26 @@ def analyze_with_claude(client, symbol, candles, perf_context="", results_contex
     counter_move = ""
     if vol_spike:
         if rsi and rsi > 65:
-            counter_move = f"SPIKE ({vol_ratio}x) bei RSI {rsi} – Erschöpfung, Reversal DOWN wahrscheinlich"
+            counter_move = f"SPIKE ({vol_ratio}x) bei RSI {rsi} – Reversal DOWN möglich"
         elif rsi and rsi < 35:
-            counter_move = f"SPIKE ({vol_ratio}x) bei RSI {rsi} – Erschöpfung, Reversal UP wahrscheinlich"
+            counter_move = f"SPIKE ({vol_ratio}x) bei RSI {rsi} – Reversal UP möglich"
         else:
             counter_move = f"SPIKE ({vol_ratio}x) – Reversal möglich"
 
-    # Kerzen-Muster
     patterns  = detect_candle_patterns(candles)
     sr        = find_support_resistance(candles)
     trend_str = analyze_trend_structure(candles)
     breakout  = detect_breakout(candles, sr)
 
-    patterns_str = "\n".join(f"  • {p}" for p in patterns) if patterns else "  • Kein bekanntes Muster erkannt"
-    breakout_str = breakout if breakout else "Kein Breakout"
+    patterns_str = "\n".join(f"  • {p}" for p in patterns) if patterns else "  • Kein Muster"
+    bb_str       = f"{bb['upper']}/{bb['mid']}/{bb['lower']}" if bb else "N/A"
+    atr_str      = f"{atr:.6f}" if atr else "N/A"
 
     candle_str = "\n".join(
         f"{datetime.fromtimestamp(c['time']/1000).strftime('%H:%M')} "
         f"O:{c['open']} H:{c['high']} L:{c['low']} C:{c['close']} V:{int(c['volume'])}"
         for c in candles[-12:]
     )
-    bb_str = f"{bb['upper']}/{bb['mid']}/{bb['lower']}" if bb else "N/A"
 
     prompt = f"""You are a professional crypto futures trader analyzing {symbol} on {INTERVAL} timeframe.
 {perf_context}{results_context}
@@ -444,49 +426,48 @@ LAST 12 CANDLES:
 {candle_str}
 
 TECHNICAL INDICATORS:
-• RSI(14):            {rsi if rsi is not None else 'N/A'}
-• EMA(20):            {ema20 if ema20 else 'N/A'}
-• EMA(50):            {ema50 if ema50 else 'N/A'}
-• MACD(12,26):        {macd if macd else 'N/A'}
-• BB Upper/Mid/Lower: {bb_str}
-• Last candle Δ:      {change:.3f}%
-• Current price:      {last['close']}
+• RSI(14):       {rsi if rsi is not None else 'N/A'}
+• EMA(20):       {ema20 if ema20 else 'N/A'}
+• EMA(50):       {ema50 if ema50 else 'N/A'}
+• MACD(12,26):   {macd if macd else 'N/A'}
+• BB:            {bb_str}
+• ATR(14):       {atr_str}
+• Last candle Δ: {change:.3f}%
+• Price:         {last['close']}
 
-VOLUME ANALYSIS:
-• Volume ratio:       {vol_ratio}x avg
-• Volume trend:       {vol_trend}
-• Volume spike:       {'YES – ' + counter_move if vol_spike else 'NO'}
+VOLUME:
+• Ratio:  {vol_ratio}x avg (min required: {MIN_VOL_RATIO}x)
+• Trend:  {vol_trend}
+• Spike:  {'YES – ' + counter_move if vol_spike else 'NO'}
 
-CANDLE PATTERNS DETECTED:
+CANDLE PATTERNS:
 {patterns_str}
 
-TREND STRUCTURE:
-• {trend_str}
+TREND STRUCTURE: {trend_str}
 
 SUPPORT & RESISTANCE:
-• Resistance:  {sr['resistance']} ({sr['dist_res']}% away)
-• Support:     {sr['support']} ({sr['dist_sup']}% away)
-• Price pos.:  {sr['position']} der Mitte
-• Breakout:    {breakout_str}
+• Resistance: {sr['resistance']} ({sr['dist_res']}% away)
+• Support:    {sr['support']} ({sr['dist_sup']}% away)
+• Position:   {sr['position']}
+• Breakout:   {breakout if breakout else 'None'}
 
-TRADING RULES:
-- Candle patterns ADD weight to signals – Engulfing/Hammer/Stars are strong signals
-- Breakout WITH volume = strong entry signal
-- Breakout WITHOUT volume = wait for confirmation
-- Price near resistance + bearish pattern = SELL bias
-- Price near support + bullish pattern = BUY bias
-- DOJI near extremes = possible reversal, wait for confirmation
-- Trend structure must align with signal direction
-- Only signal BUY/SELL when 3+ factors align (indicators + pattern + volume)
-- Be BALANCED: give SELL when bearish, BUY when bullish
+STRICT FILTERS (must be respected):
+1. NO BUY if EMA20 < EMA50 AND RSI < 45 (downtrend)
+2. NO SELL if EMA20 > EMA50 AND RSI > 55 (uptrend)
+3. Volume must be at least {MIN_VOL_RATIO}x average
+4. Confidence must reflect ALL factors – be strict, min 75% only if very clear
+5. Use ATR for SL/TP: SL = 1x ATR, TP = 2x ATR from entry
 
-Set SL 1-2% away, TP 2-3% away based on S/R levels.
+SIGNAL RULES:
+- BUY: price above/near support + bullish pattern + EMA alignment + volume
+- SELL: price below/near resistance + bearish pattern + EMA alignment + volume
+- HOLD: when filters fail or insufficient confluence
 
-Respond ONLY with valid JSON, no markdown:
+Respond ONLY with valid JSON:
 {{
   "signal": "BUY" or "SELL" or "HOLD",
   "confidence": integer 0-100,
-  "reasoning": "max 180 chars including pattern info",
+  "reasoning": "max 200 chars",
   "entry": {last['close']},
   "stopLoss": number,
   "takeProfit": number,
@@ -496,7 +477,7 @@ Respond ONLY with valid JSON, no markdown:
   "volumeRatio": {vol_ratio},
   "volumeSpike": {"true" if vol_spike else "false"},
   "patterns": {json.dumps(patterns)},
-  "breakout": "{breakout_str}"
+  "breakout": "{breakout if breakout else 'None'}"
 }}"""
 
     message = client.messages.create(
@@ -516,7 +497,7 @@ def save_signal(signal_data):
         writer = csv.DictWriter(f, fieldnames=[
             "timestamp", "symbol", "signal", "confidence", "entry",
             "stopLoss", "takeProfit", "risk", "trend", "rsi",
-            "volumeRatio", "patterns", "breakout", "reasoning"
+            "volumeRatio", "patterns", "breakout", "reasoning", "filtered"
         ])
         if not file_exists:
             writer.writeheader()
@@ -535,6 +516,7 @@ def save_signal(signal_data):
             "patterns":    str(signal_data.get("patterns", [])),
             "breakout":    signal_data.get("breakout", ""),
             "reasoning":   signal_data.get("reasoning"),
+            "filtered":    signal_data.get("filtered", False),
         })
 
 # ── Performance ───────────────────────────────────────────────────────────────
@@ -548,26 +530,32 @@ def get_perf_context(symbol, perf):
     data = perf.get(symbol, {})
     if not data or data.get("total", 0) == 0:
         return ""
-    return (f"\nSIGNAL HISTORY ({data['total']} total): "
-            f"BUY: {data.get('buy',0)} | SELL: {data.get('sell',0)} | HOLD: {data.get('hold',0)}")
+    return (f"\nHISTORY ({data['total']} signals): "
+            f"BUY:{data.get('buy',0)} SELL:{data.get('sell',0)} HOLD:{data.get('hold',0)}")
 
 def get_results_context(symbol):
     results  = load_results()
     sym_data = results.get("by_symbol", {}).get(symbol, {})
     if not sym_data:
         return ""
-    wins   = sym_data.get("wins", 0)
-    losses = sym_data.get("losses", 0)
-    pnl    = sym_data.get("pnl", 0)
-    total  = wins + losses
-    wr     = round(wins / total * 100) if total > 0 else 0
-    return f"\nRESULTS ({symbol}): {wins}W/{losses}L | Win-Rate: {wr}% | PnL: {pnl:+.2f}%"
+    wins = sym_data.get("wins", 0); losses = sym_data.get("losses", 0)
+    pnl  = sym_data.get("pnl", 0); total  = wins + losses
+    wr   = round(wins / total * 100) if total > 0 else 0
+    return f"\nRESULTS: {wins}W/{losses}L | WinRate:{wr}% | PnL:{pnl:+.2f}%"
 
 def update_performance(symbol, signal, perf):
     if symbol not in perf:
-        perf[symbol] = {"total": 0, "buy": 0, "sell": 0, "hold": 0}
+        perf[symbol] = {"total": 0, "buy": 0, "sell": 0, "hold": 0, "filtered": 0}
     perf[symbol]["total"] += 1
     perf[symbol][signal.lower()] = perf[symbol].get(signal.lower(), 0) + 1
+    with open(REPORT_FILE, "w") as f:
+        json.dump(perf, f, indent=2)
+    return perf
+
+def update_filtered(symbol, perf):
+    if symbol not in perf:
+        perf[symbol] = {"total": 0, "buy": 0, "sell": 0, "hold": 0, "filtered": 0}
+    perf[symbol]["filtered"] = perf[symbol].get("filtered", 0) + 1
     with open(REPORT_FILE, "w") as f:
         json.dump(perf, f, indent=2)
     return perf
@@ -577,31 +565,27 @@ def send_daily_summary(perf):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     results = load_results()
-    wins    = results.get("wins", 0)
-    losses  = results.get("losses", 0)
-    total   = wins + losses
-    wr      = round(wins / total * 100) if total > 0 else 0
-    pnl     = results.get("total_pnl", 0)
+    wins = results.get("wins", 0); losses = results.get("losses", 0)
+    total = wins + losses
+    wr  = round(wins / total * 100) if total > 0 else 0
+    pnl = results.get("total_pnl", 0)
 
-    msg  = "📊 <b>TÄGLICHE ZUSAMMENFASSUNG</b>\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
+    msg  = "📊 <b>TÄGLICHE ZUSAMMENFASSUNG</b>\n━━━━━━━━━━━━━━━━━━━━\n"
     msg += f"Gesamt: {wins}W / {losses}L | Win-Rate: {wr}%\n"
     msg += f"Gesamt PnL: {'+' if pnl >= 0 else ''}{pnl:.2f}%\n\n"
     for sym in SYMBOLS:
         d  = perf.get(sym, {})
         rd = results.get("by_symbol", {}).get(sym, {})
-        w  = rd.get("wins", 0)
-        l  = rd.get("losses", 0)
-        p  = rd.get("pnl", 0)
-        msg += f"<b>{sym}</b>: {d.get('buy',0)}B/{d.get('sell',0)}S/{d.get('hold',0)}H"
+        w  = rd.get("wins", 0); l = rd.get("losses", 0); p = rd.get("pnl", 0)
+        msg += f"<b>{sym}</b>: {d.get('buy',0)}B/{d.get('sell',0)}S | Filter: {d.get('filtered',0)}"
         if w + l > 0:
             msg += f" | {w}W/{l}L | {'+' if p >= 0 else ''}{p:.2f}%"
         msg += "\n"
     send_telegram(msg)
-    log("Tägliche Zusammenfassung per Telegram gesendet", "OK")
+    log("Tägliche Zusammenfassung gesendet", "OK")
 
 # ── Signal anzeigen ───────────────────────────────────────────────────────────
-def print_signal(symbol, result, price):
+def print_signal(symbol, result, price, filtered=False, filter_reason=""):
     sig       = result["signal"]
     conf      = result["confidence"]
     trend     = result["trend"]
@@ -611,23 +595,23 @@ def print_signal(symbol, result, price):
     patterns  = result.get("patterns", [])
     breakout  = result.get("breakout", "")
 
-    sig_str   = green(f"▲ {sig}") if sig == "BUY" else red(f"▼ {sig}") if sig == "SELL" else yellow(f"● {sig}")
-    conf_str  = green(f"{conf}%") if conf >= MIN_CONF else yellow(f"{conf}%")
+    sig_str  = green(f"▲ {sig}") if sig == "BUY" else red(f"▼ {sig}") if sig == "SELL" else yellow(f"● {sig}")
+    conf_str = green(f"{conf}%") if conf >= MIN_CONF else yellow(f"{conf}%")
 
     print()
     print(f"  ┌─ {bold(symbol)} {'─'*30}")
     print(f"  │  Signal:     {sig_str}  Confidence: {conf_str}")
+    if filtered:
+        print(f"  │  {red('GEFILTERT:  ' + filter_reason)}")
     print(f"  │  Trend:      {trend}  │  RSI: {rsi_val}")
-    print(f"  │  Volumen:    {vol_ratio}x {'⚠ SPIKE' if vol_spike else ''}")
-    if patterns:
-        for p in patterns:
-            print(f"  │  Muster:     {yellow(p)}")
-    if breakout and breakout != "Kein Breakout":
+    print(f"  │  Volumen:    {vol_ratio}x {'⚠ SPIKE' if vol_spike else ''} (Min: {MIN_VOL_RATIO}x)")
+    for p in patterns:
+        print(f"  │  Muster:     {yellow(p)}")
+    if breakout and breakout != "None":
         print(f"  │  Breakout:   {cyan(breakout)}")
     print(f"  │  Preis:      ${price:,.4f}")
-    if sig != "HOLD":
-        sl = result.get("stopLoss", 0)
-        tp = result.get("takeProfit", 0)
+    if sig != "HOLD" and not filtered:
+        sl = result.get("stopLoss", 0); tp = result.get("takeProfit", 0)
         print(f"  │  Entry:      ${result.get('entry', price):,.4f}")
         print(f"  │  Stop Loss:  {red(f'${sl:,.4f}')}")
         print(f"  │  Take Profit:{green(f'${tp:,.4f}')}")
@@ -636,44 +620,43 @@ def print_signal(symbol, result, price):
     print(f"  └{'─'*38}")
 
 # ── Zusammenfassung ───────────────────────────────────────────────────────────
-def print_summary(results_dict, results):
+def print_summary(results_dict, results, filtered_count):
     print()
     print(bold(f"  {'─'*50}"))
     print(bold("  ZYKLUS ZUSAMMENFASSUNG"))
     print(f"  {'─'*50}")
     for sym, res in results_dict.items():
         if res is None:
-            print(f"  {sym:<12} {red('FEHLER')}")
-            continue
+            print(f"  {sym:<12} {red('FEHLER')}"); continue
         sig     = res["signal"]
         sig_str = green("BUY ") if sig == "BUY" else red("SELL") if sig == "SELL" else yellow("HOLD")
         conf    = res["confidence"]
-        pats    = res.get("patterns", [])
-        pat_str = f" │ {yellow(pats[0][:30]+'...' if len(pats[0]) > 30 else pats[0])}" if pats else ""
-        print(f"  {sym:<12} {sig_str}  {conf}%  {gray(res.get('trend','?'))}{pat_str}")
+        fil     = " [GEFILTERT]" if res.get("filtered") else ""
+        print(f"  {sym:<12} {sig_str}  {conf}%  {gray(res.get('trend','?'))}{yellow(fil)}")
     print(f"  {'─'*50}")
+    if filtered_count > 0:
+        print(f"  {yellow(f'{filtered_count} Signal(e) durch Filter blockiert')}")
 
-    wins   = results.get("wins", 0)
-    losses = results.get("losses", 0)
-    total  = wins + losses
+    wins = results.get("wins", 0); losses = results.get("losses", 0)
+    total = wins + losses
     if total > 0:
         wr  = round(wins / total * 100)
         pnl = results.get("total_pnl", 0)
-        print(f"\n  TRACKING: {green(f'{wins}W')} / {red(f'{losses}L')} | "
-              f"Win-Rate: {green(f'{wr}%') if wr >= 50 else red(f'{wr}%')} | "
-              f"PnL: {green(f'+{pnl:.2f}%') if pnl >= 0 else red(f'{pnl:.2f}%')}")
+        wr_str = green(f"{wr}%") if wr >= 50 else red(f"{wr}%")
+        pnl_str = green(f"+{pnl:.2f}%") if pnl >= 0 else red(f"{pnl:.2f}%")
+        print(f"\n  TRACKING: {green(f'{wins}W')} / {red(f'{losses}L')} | Win-Rate: {wr_str} | PnL: {pnl_str}")
     print()
 
 # ── Haupt-Bot-Loop ────────────────────────────────────────────────────────────
 def run_bot():
     print()
     print(bold(green("╔══════════════════════════════════════════════════════════╗")))
-    print(bold(green("║         BITUNIX MULTI-ASSET AI BOT v3                   ║")))
-    print(bold(green("║         Powered by Claude AI                             ║")))
+    print(bold(green("║         BITUNIX MULTI-ASSET AI BOT v4                   ║")))
     print(bold(green("╠══════════════════════════════════════════════════════════╣")))
-    print(bold(green(f"║  Symbole:  {' · '.join(SYMBOLS):<44}║")))
-    print(bold(green(f"║  Muster:   Hammer · Engulfing · Doji · Stars · Breakout ║")))
-    print(bold(green(f"║  Telegram: {'AN' if TELEGRAM_TOKEN else 'AUS'}{'':>48}║")))
+    print(bold(green(f"║  Symbole:    {' · '.join(SYMBOLS):<43}║")))
+    print(bold(green(f"║  Min Conf:   {MIN_CONF}% (erhöht von 65%)                        ║")))
+    print(bold(green(f"║  Min Vol:    {MIN_VOL_RATIO}x Durchschnitt                           ║")))
+    print(bold(green(f"║  Trend-Filter: aktiv (kein BUY im Downtrend)           ║")))
     print(bold(green("╚══════════════════════════════════════════════════════════╝")))
     print()
 
@@ -681,21 +664,22 @@ def run_bot():
         print(red("FEHLER: ANTHROPIC_API_KEY fehlt in .env"))
         return
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    perf   = load_performance()
-    cycle  = 0
+    client     = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    perf       = load_performance()
+    cycle      = 0
     last_daily = datetime.now().date()
 
     log("Claude API verbunden ✓", "OK")
-    log(f"Telegram: {'aktiv' if TELEGRAM_TOKEN else 'nicht konfiguriert'}", "INFO")
-    log("Kerzen-Muster Erkennung: aktiv", "OK")
-    log("Starte erste Analyse...", "INFO")
+    log(f"Mindest-Confidence: {MIN_CONF}%", "INFO")
+    log(f"Mindest-Volumen: {MIN_VOL_RATIO}x", "INFO")
+    log("Trend-Filter: aktiv", "OK")
 
     if TELEGRAM_TOKEN:
         send_telegram(
-            "🚀 <b>Bitunix AI Bot v3 gestartet</b>\n"
-            "Analysiere: " + " · ".join(SYMBOLS) + "\n"
-            "Neu: Kerzen-Muster, Support/Resistance, Breakout"
+            "🚀 <b>Bitunix Bot v4 gestartet</b>\n"
+            f"Min Confidence: {MIN_CONF}%\n"
+            f"Min Volumen: {MIN_VOL_RATIO}x\n"
+            "Trend-Filter: aktiv"
         )
 
     while True:
@@ -705,20 +689,34 @@ def run_bot():
         print(bold(f"  ZYKLUS #{cycle}  │  {now}"))
         print(bold(f"{'═'*58}"))
 
-        results_dict = {}
-        results      = load_results()
+        results_dict   = {}
+        results        = load_results()
+        filtered_count = 0
 
         for symbol in SYMBOLS:
             log(f"[{symbol}] Lade Kerzen...", "INFO")
             try:
                 candles = fetch_candles(symbol)
                 price   = candles[-1]["close"]
-                log(f"[{symbol}] Preis: ${price:,.4f}  │  {len(candles)} Kerzen", "OK")
+                log(f"[{symbol}] Preis: ${price:,.4f}", "OK")
                 results = check_open_signals(symbol, price)
             except Exception as e:
-                log(f"[{symbol}] Kerzen-Fehler: {e}", "ERROR")
+                log(f"[{symbol}] Fehler: {e}", "ERROR")
                 results_dict[symbol] = None
                 time.sleep(3)
+                continue
+
+            # Volumen-Filter prüfen
+            vol_ok, vol_ratio = check_volume_filter(candles)
+            if not vol_ok:
+                log(f"[{symbol}] SKIP: Volumen zu niedrig ({vol_ratio}x < {MIN_VOL_RATIO}x)", "SKIP")
+                results_dict[symbol] = {"signal": "HOLD", "confidence": 0, "trend": "N/A",
+                                        "volumeRatio": vol_ratio, "filtered": True,
+                                        "reasoning": f"Volumen zu niedrig: {vol_ratio}x",
+                                        "patterns": [], "breakout": "None"}
+                perf = update_filtered(symbol, perf)
+                filtered_count += 1
+                time.sleep(2)
                 continue
 
             log(f"[{symbol}] Claude analysiert...", "INFO")
@@ -726,7 +724,25 @@ def run_bot():
                 perf_ctx    = get_perf_context(symbol, perf)
                 results_ctx = get_results_context(symbol)
                 result      = analyze_with_claude(client, symbol, candles, perf_ctx, results_ctx)
-                result["symbol"] = symbol
+                result["symbol"]   = symbol
+                result["filtered"] = False
+
+                # Trend-Filter prüfen
+                rsi_val = result.get("rsi")
+                ema20   = calc_ema([c["close"] for c in candles], 20)
+                ema50   = calc_ema([c["close"] for c in candles], 50)
+                trend_ok, filter_reason = check_trend_filter(result["signal"], ema20, ema50, rsi_val)
+
+                if not trend_ok:
+                    log(f"[{symbol}] SKIP: {filter_reason}", "SKIP")
+                    result["filtered"] = True
+                    result["filter_reason"] = filter_reason
+                    filtered_count += 1
+                    print_signal(symbol, result, price, filtered=True, filter_reason=filter_reason)
+                    perf = update_filtered(symbol, perf)
+                    results_dict[symbol] = result
+                    time.sleep(2)
+                    continue
 
                 print_signal(symbol, result, price)
                 save_signal(result)
@@ -734,24 +750,20 @@ def run_bot():
                 results_dict[symbol] = result
                 add_open_signal(result)
 
+                # Telegram bei starkem Signal
                 if result["signal"] != "HOLD" and result["confidence"] >= MIN_CONF:
                     patterns = result.get("patterns", [])
-                    pat_str  = "\n".join(f"  • {p}" for p in patterns) if patterns else ""
-                    breakout = result.get("breakout", "")
                     emoji    = "🟢" if result["signal"] == "BUY" else "🔴"
                     sl       = result.get("stopLoss", 0)
                     tp       = result.get("takeProfit", 0)
                     msg      = (
                         f"{emoji} <b>{result['signal']}: {symbol}</b>\n"
-                        f"Preis: ${price:,.4f}\n"
-                        f"Confidence: {result['confidence']}%\n"
-                        f"Trend: {result['trend']} | RSI: {result.get('rsi','?')}\n"
+                        f"Preis: ${price:,.4f} | Conf: {result['confidence']}%\n"
+                        f"RSI: {rsi_val} | Vol: {vol_ratio}x\n"
                         f"SL: ${sl:,.4f} | TP: ${tp:,.4f}\n"
                     )
-                    if pat_str:
-                        msg += f"Muster:\n{pat_str}\n"
-                    if breakout and breakout != "Kein Breakout":
-                        msg += f"Breakout: {breakout}\n"
+                    if patterns:
+                        msg += "Muster: " + ", ".join(patterns[:2]) + "\n"
                     msg += f"📝 {result.get('reasoning','')}"
                     send_telegram(msg)
 
@@ -761,32 +773,31 @@ def run_bot():
 
             time.sleep(3)
 
-        print_summary(results_dict, results)
+        print_summary(results_dict, results, filtered_count)
 
-        print(bold("  GESAMTE STATISTIK:"))
+        print(bold("  STATISTIK:"))
         for sym in SYMBOLS:
             d = perf.get(sym, {})
             if d.get("total", 0) > 0:
-                print(f"  {sym:<12} Gesamt: {d['total']:>4}  "
-                      f"BUY: {green(str(d.get('buy',0)))}  "
-                      f"SELL: {red(str(d.get('sell',0)))}  "
-                      f"HOLD: {yellow(str(d.get('hold',0)))}")
+                print(f"  {sym:<12} "
+                      f"BUY:{green(str(d.get('buy',0)))} "
+                      f"SELL:{red(str(d.get('sell',0)))} "
+                      f"HOLD:{yellow(str(d.get('hold',0)))} "
+                      f"FILTER:{gray(str(d.get('filtered',0)))}")
 
         today = datetime.now().date()
         if today > last_daily and datetime.now().hour >= 8:
             send_daily_summary(perf)
             last_daily = today
 
-        log(f"Nächste Analyse in {CYCLE_MIN} Minuten. STRG+C zum Beenden.", "INFO")
+        log(f"Nächste Analyse in {CYCLE_MIN} Minuten.", "INFO")
         try:
             for remaining in range(CYCLE_MIN * 60, 0, -30):
-                mins = remaining // 60
-                secs = remaining % 60
+                mins = remaining // 60; secs = remaining % 60
                 print(f"\r  {gray(f'Nächste Analyse in: {mins:02d}:{secs:02d}')}  ", end="", flush=True)
                 time.sleep(30)
         except KeyboardInterrupt:
-            print()
-            log("Bot gestoppt.", "WARN")
+            print(); log("Bot gestoppt.", "WARN")
             send_telegram("⛔ <b>Bot gestoppt</b>")
             break
 
@@ -796,5 +807,4 @@ if __name__ == "__main__":
     try:
         run_bot()
     except KeyboardInterrupt:
-        print()
-        log("Bot beendet.", "WARN")
+        print(); log("Bot beendet.", "WARN")
