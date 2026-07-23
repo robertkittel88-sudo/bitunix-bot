@@ -42,9 +42,11 @@ MAX_TRADES_DAY = 2
 AUTO_TRADE = False
 
 # Asset-spezifische SL/TP basierend auf Backtest
+# LSOB v1 Parameter (beste Backtest-Ergebnisse)
+# ETH: 43.6% Win-Rate | HBAR: 50.4% Win-Rate
 SL_TP = {
-    "ETHUSDT":  {"sl": 0.010, "tp": 0.030},  # 1% SL / 3% TP
-    "HBARUSDT": {"sl": 0.020, "tp": 0.050},  # 2% SL / 5% TP
+    "ETHUSDT":  {"sl": 0.010, "tp": 0.030},  # 1% SL / 3% TP (1:3)
+    "HBARUSDT": {"sl": 0.010, "tp": 0.030},  # 1% SL / 3% TP (1:3)
 }
 
 BINANCE_BASE = "https://fapi.binance.com"
@@ -257,11 +259,13 @@ def analyze_lsob(symbol, candles_1h, trend_4h):
     if vol_ratio < MIN_VOL:
         return None, f"Volumen zu niedrig ({vol_ratio}x)"
 
+    # LSOB v1 Parameter – kein Session-Filter, kein ADX-Filter
+
     swing_highs, swing_lows = find_swing_highs_lows(candles_1h)
     bos      = detect_bos(candles_1h, swing_highs, swing_lows)
     choch    = detect_choch(candles_1h, swing_highs, swing_lows)
     obs      = find_order_blocks(candles_1h)
-    fvgs     = find_fvg(candles_1h)
+    fvgs     = find_fvg(candles_1h)  # LSOB v1: max 5 Kerzen
     sweep    = detect_liquidity_sweep(candles_1h, swing_highs, swing_lows)
     price_ob = price_in_ob(current_price, obs)
 
@@ -595,7 +599,7 @@ def run_bot():
     print(bold(green("╠══════════════════════════════════════════════════════════╣")))
     print(bold(green(f"║  Symbole:    {' · '.join(SYMBOLS):<43}║")))
     print(bold(green(f"║  Entry:      {INTERVAL} │ Trend: {TF_TREND} │ Zyklus: {CYCLE_MIN}min           ║")))
-    print(bold(green(f"║  ETH SL/TP:  1% / 3% │ HBAR SL/TP: 2% / 5%          ║")))
+    print(bold(green(f"║  SL/TP:      1% / 3% (LSOB v1 – beste Backtest-WR)   ║")))
     print(bold(green(f"║  Min Conf:   {MIN_CONF}% │ Min Vol: {MIN_VOL}x │ Max {MAX_TRADES_DAY}/Tag         ║")))
     print(bold(green("╚══════════════════════════════════════════════════════════╝")))
     print()
@@ -612,7 +616,7 @@ def run_bot():
     log("Claude API verbunden ✓", "OK")
     log("LSOB Strategie: Liquidity Sweep + OB + BOS/CHoCH + FVG", "INFO")
     log(f"4h Trend-Filter: aktiv", "OK")
-    log(f"Asset-spezifische SL/TP: ETH 1%/3% | HBAR 2%/5%", "INFO")
+    log(f"SL/TP: 1%/3% für alle Symbole (LSOB v1 Parameter)", "INFO")
 
     if TELEGRAM_TOKEN:
         send_telegram(
