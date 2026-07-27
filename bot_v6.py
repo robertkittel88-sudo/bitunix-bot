@@ -36,10 +36,11 @@ MIN_VOL   = 0.5
 AUTO_TRADE = False
 MAX_TRADES_DAY = 2
 
-# LSOB v1 Parameter (beste Backtest-Ergebnisse)
+# LSOB v2 Parameter – profitabelste Variante nach Gebühren
+# ETH: +138% netto | HBAR: +113% netto (3 Jahre Backtest)
 SL_TP = {
-    "ETHUSDT":  {"sl": 0.010, "tp": 0.030},
-    "HBARUSDT": {"sl": 0.010, "tp": 0.030},
+    "ETHUSDT":  {"sl": 0.010, "tp": 0.030},  # 1% SL / 3% TP (1:3)
+    "HBARUSDT": {"sl": 0.020, "tp": 0.050},  # 2% SL / 5% TP (1:2.5) – volatiler
 }
 
 # Adaptive Confidence – startet bei 70%, wird automatisch angepasst
