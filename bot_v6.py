@@ -27,7 +27,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SYMBOLS   = ["ETHUSDT", "HBARUSDT"]
+SYMBOLS   = ["ETHUSDT", "HBARUSDT", "BNBUSDT"]
 INTERVAL  = "1h"
 TF_TREND  = "4h"
 LIMIT     = 100
@@ -41,6 +41,7 @@ MAX_TRADES_DAY = 2
 SL_TP = {
     "ETHUSDT":  {"sl": 0.010, "tp": 0.030},  # 1% SL / 3% TP (1:3)
     "HBARUSDT": {"sl": 0.020, "tp": 0.050},  # 2% SL / 5% TP (1:2.5) – volatiler
+    "BNBUSDT":  {"sl": 0.010, "tp": 0.030},  # 1% SL / 3% TP (1:3)
 }
 
 # Adaptive Confidence – startet bei 70%, wird automatisch angepasst
@@ -83,6 +84,18 @@ DEFAULT_WEIGHTS = {
         "IN_BEARISH_OB":   3.0,
         "BULLISH_FVG":     3.0,  # Backtest: 55.4% – stark gewichtet
         "BEARISH_FVG":     2.5,
+    },
+    "BNBUSDT": {
+        "BULLISH_SWEEP":   1.5,  # Backtest: 37.5%
+        "BEARISH_SWEEP":   0.5,  # Backtest: 17.9% – schwach, wenig gewichtet
+        "BULLISH_BOS":     3.5,  # Backtest: 43.9%
+        "BEARISH_BOS":     3.5,  # Backtest: 44.4%
+        "BULLISH_CHOCH":   3.0,
+        "BEARISH_CHOCH":   3.0,
+        "IN_BULLISH_OB":   3.5,  # Backtest: 44.8% – stärkste Komponente
+        "IN_BEARISH_OB":   1.5,  # Backtest: 23.1% – schwach
+        "BULLISH_FVG":     3.5,  # Backtest: 44.6% – stark
+        "BEARISH_FVG":     3.0,  # Backtest: 40.7%
     },
 }
 
@@ -138,7 +151,7 @@ def load_conf():
     if Path(CONF_FILE).exists():
         with open(CONF_FILE) as f:
             return json.load(f)
-    return {"ETHUSDT": BASE_CONF, "HBARUSDT": BASE_CONF}
+    return {"ETHUSDT": BASE_CONF, "HBARUSDT": BASE_CONF, "BNBUSDT": BASE_CONF}
 
 def save_conf(conf):
     with open(CONF_FILE, "w") as f:
