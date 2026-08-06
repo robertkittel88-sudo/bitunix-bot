@@ -840,7 +840,18 @@ def run_bot():
         print(f"\r{' '*50}\r", end="")
 
 if __name__ == "__main__":
-    try:
-        run_bot()
-    except KeyboardInterrupt:
-        print(); log("Bot beendet.", "WARN")
+    while True:
+        try:
+            run_bot()
+            break  # normaler Exit (z.B. STRG+C wurde in run_bot behandelt)
+        except KeyboardInterrupt:
+            print(); log("Bot beendet.", "WARN")
+            break
+        except Exception as e:
+            import traceback
+            print()
+            log(f"UNERWARTETER FEHLER: {e}", "ERROR")
+            traceback.print_exc()
+            send_telegram(f"⚠️ <b>Bot v6 Fehler</b>\n{str(e)[:200]}\nStarte in 30s neu...")
+            log("Neustart in 30 Sekunden...", "WARN")
+            time.sleep(30)
