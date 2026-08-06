@@ -459,7 +459,7 @@ def analyze_lsob(symbol, candles_1h, trend_4h, weights, min_conf):
     tp = round(price*(1+tp_pct), 6) if signal=="BUY" else round(price*(1-tp_pct), 6)
 
     return {
-        "signal": signal, "confidence": confidence, "price": price,
+        "signal": signal, "confidence": confidence, "price": price, "entry": price,
         "sl": sl, "tp": tp, "sl_pct": sl_pct, "tp_pct": tp_pct,
         "vol_ratio": vol_ratio, "bull_pts": round(bull_pts,1),
         "bear_pts": round(bear_pts,1), "reasons": reasons, "trend_4h": trend_4h,
